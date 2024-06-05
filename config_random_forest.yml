@@ -1,0 +1,10 @@
+threshold_nan: 0.5
+threshold_corr_to_y: 0.1
+
+resampling_threshold: 1
+number_of_folds: 2
+
+depth: 3
+type_of_loss: 'entropy'
+number_of_trees: 20
+1_prediction_threshold: 0.6
