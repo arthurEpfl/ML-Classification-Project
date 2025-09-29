@@ -1,0 +1,168 @@
+# ====================== Pedroni tests from CSV (no purrr) =================
+# If needed:
+# install.packages(c("plm","zoo","pco"))
+
+library(plm)
+library(zoo)
+library(pco)
+
+# ---- 1) READ CSV ----------------------------------------------------------
+csv_path <- "df_pedroni_temp.csv"
+df <- read.csv(csv_path, stringsAsFactors = FALSE, check.names = FALSE)
+
+# normalize column names a bit (spaces/dots -> underscores)
+norm_names <- function(x) {
+  x <- gsub("\\.+", "_", x, perl = TRUE)
+  x <- gsub("\\s+", "_", x, perl = TRUE)
+  x
+}
+names(df) <- norm_names(names(df))
+
+# common variants for Client_segment
+if (!"Client_segment" %in% names(df)) {
+  cand <- intersect(c("Client_Segment","Clientsegment","CLient_segment","Client_segment."), names(df))
+  if (length(cand) == 1) names(df)[names(df) == cand] <- "Client_segment"
+}
+
+# ---- 2) COLUMN NAMES / TEST SETTINGS -------------------------------------
+id_country  <- "Country"
+id_product  <- "Product"
+id_segment  <- "Client_segment"
+time_col    <- "Period"      # "YYYY-MM"
+dep_BR      <- "BR"          # dependent (bank rate)
+reg_MR      <- "MR"          # regressor (market rate)
+
+type_stat <- 2   # 1:none, 2:intercept-only, 3:intercept+trend
+kk <- 0          # Newey–West bandwidth: 0 => automatic
+ka <- 2          # ADF lag(s) in residual regression
+
+req <- c(id_country,id_product,id_segment,time_col,dep_BR,reg_MR)
+missing_req <- setdiff(req, names(df))
+stopifnot(length(missing_req) == 0)
+
+# ---- 3) PARSE TIME & ORDER ------------------------------------------------
+df$.t <- as.Date(as.yearmon(df[[time_col]], "%Y-%m"))
+df <- df[order(df[[id_country]], df$.t), ]
+
+# ---- 4) HELPERS -----------------------------------------------------------
+make_mat <- function(dat, vname) {
+  # Base R reshape: wide by country; columns like "BR.FR", "BR.DE", ...
+  keep <- dat[, c(id_country, ".t", vname)]
+  colnames(keep) <- c("Country", ".t", "val")
+  wide <- reshape(keep,
+                  timevar = "Country", idvar = ".t",
+                  direction = "wide")
+  # order by time, drop time col
+  wide <- wide[order(wide$.t), , drop = FALSE]
+  mat <- as.matrix(wide[, grep("^val\\.", names(wide)), drop = FALSE])
+  # set nice colnames = country codes
+  cn <- sub("^val\\.", "", colnames(mat))
+  colnames(mat) <- cn
+  rownames(mat) <- as.character(wide$.t)
+  storage.mode(mat) <- "double"
+  mat
+}
+
+run_cell <- function(dat_cell, seg, prod) {
+  n_c <- length(unique(dat_cell[[id_country]]))
+  n_t <- length(unique(dat_cell$.t))
+  # require a minimally informative panel
+  if (n_c < 3 || n_t < 24) {
+    return(data.frame(
+      Client_segment = seg, Product = prod,
+      N = n_c, T = n_t,
+      sample_start = if (n_t) as.character(min(dat_cell$.t)) else NA,
+      sample_end   = if (n_t) as.character(max(dat_cell$.t)) else NA,
+      nipanel_Z = NA, rhopanel_Z = NA, tpanelPP_Z = NA, tpanelADF_Z = NA,
+      rhogroup_Z = NA, tgroupPP_Z = NA, tgroupADF_Z = NA,
+      nipanel_p = NA, rhopanel_p = NA, tpanelPP_p = NA, tpanelADF_p = NA,
+      rhogroup_p = NA, tgroupPP_p = NA, tgroupADF_p = NA,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  Y_mat <- make_mat(dat_cell, dep_BR)  # BR (dependent)
+  X_mat <- make_mat(dat_cell, reg_MR)  # MR (regressor)
+
+  # align time rows and country columns
+  common_rows <- intersect(rownames(Y_mat), rownames(X_mat))
+  common_cols <- intersect(colnames(Y_mat), colnames(X_mat))
+  Y <- Y_mat[common_rows, common_cols, drop = FALSE]
+  X <- X_mat[common_rows, common_cols, drop = FALSE]
+
+  # drop any time with missing in any country (Pedroni needs balanced slices)
+  ok_rows <- which(rowSums(is.na(Y)) == 0 & rowSums(is.na(X)) == 0)
+  Y <- Y[ok_rows, , drop = FALSE]
+  X <- X[ok_rows, , drop = FALSE]
+
+  Tn <- nrow(Y); Nn <- ncol(Y)
+  if (Tn < 24 || Nn < 3) {
+    return(data.frame(
+      Client_segment = seg, Product = prod,
+      N = Nn, T = Tn,
+      sample_start = if (Tn) rownames(Y)[1] else NA,
+      sample_end   = if (Tn) rownames(Y)[Tn] else NA,
+      nipanel_Z = NA, rhopanel_Z = NA, tpanelPP_Z = NA, tpanelADF_Z = NA,
+      rhogroup_Z = NA, tgroupPP_Z = NA, tgroupADF_Z = NA,
+      nipanel_p = NA, rhopanel_p = NA, tpanelPP_p = NA, tpanelADF_p = NA,
+      rhogroup_p = NA, tgroupPP_p = NA, tgroupADF_p = NA,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  cube <- array(NA_real_, dim = c(Tn, Nn, 2))
+  cube[, , 1] <- Y
+  cube[, , 2] <- X
+
+  ped <- pedroni99m(X = cube, kk = kk, type.stat = type_stat, ka = ka)
+  Z <- ped$STATISTIC[, "standardized"]
+  # tail rules
+  right_tail <- "nipanel"                  # variance-ratio: right-tailed
+  left_stats <- setdiff(names(Z), "nipanel")  # rho, PP, ADF: left-tailed
+
+  pvals <- rep(NA_real_, length(Z)); names(pvals) <- names(Z)
+  pvals[right_tail] <- 1 - pnorm(Z[right_tail])
+  pvals[left_stats] <- pnorm(Z[left_stats])
+
+  data.frame(
+    Client_segment = seg, Product = prod,
+    N = Nn, T = Tn,
+    sample_start = rownames(Y)[1],
+    sample_end   = rownames(Y)[Tn],
+    nipanel_Z   = unname(Z["nipanel"]),
+    rhopanel_Z  = unname(Z["rhopanel"]),
+    tpanelPP_Z  = unname(Z["tpanelnonpar"]),
+    tpanelADF_Z = unname(Z["tpanelpar"]),
+    rhogroup_Z  = unname(Z["rhogroup"]),
+    tgroupPP_Z  = unname(Z["tgroupnonpar"]),
+    tgroupADF_Z = unname(Z["tgrouppar"]),
+    nipanel_p   = unname(pvals["nipanel"]),
+    rhopanel_p  = unname(pvals["rhopanel"]),
+    tpanelPP_p  = unname(pvals["tpanelnonpar"]),
+    tpanelADF_p = unname(pvals["tpanelpar"]),
+    rhogroup_p  = unname(pvals["rhogroup"]),
+    tgroupPP_p  = unname(pvals["tgroupnonpar"]),
+    tgroupADF_p = unname(pvals["tgrouppar"]),
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---- 5) LOOP OVER (Client_segment × Product) ------------------------------
+keys <- unique(df[, c(id_segment, id_product)])
+keys <- keys[order(keys[[id_segment]], keys[[id_product]]), , drop = FALSE]
+
+out_list <- vector("list", nrow(keys))
+for (i in seq_len(nrow(keys))) {
+  seg  <- keys[i, id_segment]
+  prod <- keys[i, id_product]
+  dat_cell <- df[df[[id_segment]] == seg & df[[id_product]] == prod, ]
+  out_list[[i]] <- run_cell(dat_cell, seg, prod)
+}
+
+results <- do.call(rbind, out_list)
+
+# ---- 6) OUTPUT ------------------------------------------------------------
+print(results)
+write.csv(results, "pedroni_panel_results_by_seg_prod.csv", row.names = FALSE)
+cat("\nSaved results to: pedroni_panel_results_by_seg_prod.csv\n")
+# ==========================================================================
